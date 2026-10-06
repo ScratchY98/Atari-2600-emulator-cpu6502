@@ -45,15 +45,15 @@ typedef struct {
     uint8_t  P;
 } CPU;
 
-uint8_t rom[32768];
-size_t  rom_size;
-uint8_t ram[128];      // RIOT RAM (128 bytes)
+static uint8_t rom[32768];
+static size_t  rom_size;
+static uint8_t ram[128];      // RIOT RAM (128 bytes)
 
-size_t load_rom(const char *path)
+static size_t load_rom(const char *path)
 {
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
-        printf("Can't open ROM!\n");
+        fprintf(stderr, "Can't open ROM: %s\n", path);
         return 0;
     }
     size_t length = fread(rom, 1, sizeof rom, file);   // Whole file, from offset 0
@@ -62,64 +62,104 @@ size_t load_rom(const char *path)
     return length;
 }
 
-uint8_t cart_read(uint16_t off)          // off: 0x000-0xFFF
+static uint8_t cart_read(uint16_t off)                     // off: 0x000-0xFFF
 {
     if (rom_size == 2048) return rom[off & ROM_2K_MASK];   // 2K mirrored twice
-    return rom[off];                                        // 4K
+    return rom[off];                                       // 4K
 }
 
-uint8_t bus_read(uint16_t addr)
+static uint8_t bus_read(uint16_t addr)
 {
-    addr &= ADDR_MASK;                                  // 13-bit address bus
+    addr &= ADDR_MASK;                                     // 13-bit address bus
     if (addr & ADDR_A12)    return cart_read(addr & CART_MASK);
-    if (!(addr & ADDR_A7))  return 0;                   // TIA
+    if (!(addr & ADDR_A7))  return 0;                      // TIA
     if (!(addr & ADDR_A9))  return ram[addr & RAM_MASK];   // RAM
-    return 0;                                           // RIOT
+    return 0;                                              // RIOT
 }
 
-void update_nz_flags(CPU *cpu, uint8_t value)
+static void bus_write(uint16_t addr, uint8_t value)
+{
+    addr &= ADDR_MASK;                                     // 13-bit address bus
+    if (addr & ADDR_A12) {      // Cartridge (ROM)
+        return;
+    }
+    if (!(addr & ADDR_A7)) {    // TIA
+        return;
+    }
+    if (!(addr & ADDR_A9)) {    // RAM
+        ram[addr & RAM_MASK] = value;
+        return;
+    }
+}
+
+static void update_nz_flags(CPU *cpu, uint8_t value)
 {
     cpu->P &= ~(FLAG_N | FLAG_Z);          // Clear N and Z
     cpu->P |= value & FLAG_N;              // N = bit 7
     cpu->P |= (value == 0) ? FLAG_Z : 0;   // Z if value=0
 }
 
-void conditional_jump(CPU *cpu, uint8_t reg_value, uint8_t request_value)
+static void push(CPU *cpu, uint8_t value)
 {
-    if (reg_value == request_value) {
-        int8_t offset = bus_read(cpu->PC + 1);
-        cpu->PC += offset + 2;
-    }
-    else cpu->PC+=2;
+    bus_write(0x100 + cpu->S, value);
+    cpu->S--;
 }
 
-int execute_opcode(CPU *cpu)
+static uint8_t pull(CPU *cpu)
+{
+    cpu->S++;
+    return bus_read(0x100 + cpu->S);
+}
+
+static void push_pc(CPU *cpu, uint16_t addr)
+{
+    push(cpu, addr >> 8);
+    push(cpu, addr & 0xFF);
+}
+
+static void pull_pc(CPU *cpu)
+{
+    uint8_t low  = pull(cpu);
+    uint8_t high = pull(cpu);
+
+    cpu->PC = (high << 8) | low;
+}
+
+static void jump_absolute(CPU *cpu)
+{
+    cpu->PC = bus_read(cpu->PC + 1) | (bus_read(cpu->PC + 2) << 8);
+}
+
+static void branch(CPU *cpu, uint8_t flag, uint8_t expected)
+{
+    if (flag == expected) {
+        int8_t offset = bus_read(cpu->PC + 1);
+        cpu->PC += offset + 2;
+    } else {
+        cpu->PC += 2;
+    }
+}
+
+static int execute_opcode(CPU *cpu)
 {
     uint8_t op = bus_read(cpu->PC);
-    /*
-    uint8_t cc  =  op       & 0b11;
-    uint8_t bbb = (op >> 2) & 0b111;
-    uint8_t aaa =  op >> 5;
-    */
-
-    //printf("PC=%04X OP=%02X  aaa=%d bbb=%d cc=%d\n", cpu->PC, op, aaa, bbb, cc);
 
     if ((op & 0b00011111) == 0b00010000) {
         uint8_t xx = (op & 0b11000000) >> 6;
         uint8_t y  = (op & 0b00100000) >> 5;
-        
+
         switch (xx) {
             case 0b00: // N
-                conditional_jump(cpu, (cpu->P & FLAG_N) != 0, y);
+                branch(cpu, (cpu->P & FLAG_N) != 0, y);
                 break;
             case 0b01: // V
-                conditional_jump(cpu, (cpu->P & FLAG_V) != 0, y);
+                branch(cpu, (cpu->P & FLAG_V) != 0, y);
                 break;
             case 0b10: // C
-                conditional_jump(cpu, (cpu->P & FLAG_C) != 0, y);
+                branch(cpu, (cpu->P & FLAG_C) != 0, y);
                 break;
             case 0b11: // Z
-                conditional_jump(cpu, (cpu->P & FLAG_Z) != 0, y);
+                branch(cpu, (cpu->P & FLAG_Z) != 0, y);
                 break;
         }
 
@@ -127,8 +167,30 @@ int execute_opcode(CPU *cpu)
     }
 
     switch (op) {
+        case 0x00: // BRK
+            push_pc(cpu, cpu->PC + 2);
+            push(cpu, cpu->P | FLAG_B | FLAG_U);
+            cpu->P |= FLAG_I;
+            cpu->PC = bus_read(IRQ_VEC) | (bus_read(IRQ_VEC + 1) << 8);
+            break;
+
+        case 0x08: // PHP
+            push(cpu, cpu->P | FLAG_B | FLAG_U);
+            cpu->PC++;
+            break;
+
         case 0x18: // CLC
             cpu->P &= ~FLAG_C;
+            cpu->PC++;
+            break;
+
+        case 0x20: // JSR
+            push_pc(cpu, cpu->PC + 2);
+            jump_absolute(cpu);
+            break;
+
+        case 0x28: // PLP
+            cpu->P = (pull(cpu) & ~FLAG_B) | FLAG_U;
             cpu->PC++;
             break;
 
@@ -137,14 +199,46 @@ int execute_opcode(CPU *cpu)
             cpu->PC++;
             break;
 
+        case 0x40: { // RTI
+            uint8_t p = pull(cpu);
+            pull_pc(cpu);
+            cpu->P = (p & ~FLAG_B) | FLAG_U;
+            break;
+        }
+
+        case 0x48: // PHA
+            push(cpu, cpu->A);
+            cpu->PC++;
+            break;
+
         case 0x4C: // JMP abs
-            cpu->PC = bus_read(cpu->PC + 1) | (bus_read(cpu->PC + 2) << 8);
+            jump_absolute(cpu);
             break;
 
         case 0x58: // CLI
             cpu->P &= ~FLAG_I;
             cpu->PC++;
             break;
+
+        case 0x60: // RTS
+            pull_pc(cpu);
+            cpu->PC++;
+            break;
+
+        case 0x68: // PLA
+            cpu->A = pull(cpu);
+            update_nz_flags(cpu, cpu->A);
+            cpu->PC++;
+            break;
+
+        case 0x6C: { // JMP (ind)
+            uint16_t addr = bus_read(cpu->PC + 1) | (bus_read(cpu->PC + 2) << 8);
+            uint8_t low   = bus_read(addr);
+            uint8_t high  = bus_read((addr & 0xFF00) | ((addr + 1) & 0x00FF));
+
+            cpu->PC = (high << 8) | low;
+            break;
+        }
 
         case 0x78: // SEI
             cpu->P |= FLAG_I;
@@ -229,9 +323,12 @@ int execute_opcode(CPU *cpu)
             cpu->PC++;
             break;
 
-        default:
-            printf("UNEXPECTED OPCODE: %02X AT PC=%04X\n", op, cpu->PC);
+        default: {
+            /*uint8_t cc  =  op       & 0b11;
+            uint8_t bbb = (op >> 2) & 0b111;
+            uint8_t aaa =  op >> 5;*/
             return 0;
+        }
     }
 
     return 1;
@@ -244,14 +341,14 @@ int main(void)
     rom_size = load_rom("breakout.a26");
     if (rom_size == 0) return 1;
     if (rom_size != 2048 && rom_size != 4096) {
-        printf("Taille non geree pour l'instant : %zu\n", rom_size);
+        fprintf(stderr, "Unsupported ROM size: %zu bytes\n", rom_size);
         return 1;
     }
 
     cpu.S  = RESET_SP;
     cpu.P  = FLAG_U | FLAG_I;
     cpu.PC = bus_read(RESET_VEC) | (bus_read(RESET_VEC + 1) << 8);
-    printf("Reset vector : $%04X\n", cpu.PC);
+    printf("Reset vector: $%04X\n", cpu.PC);
 
     int running = 1;
     while (running) {
